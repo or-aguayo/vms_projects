@@ -1,0 +1,6 @@
+.env
+
+variamos_*
+
+**/__pycache__/
+

@@ -1,0 +1,13 @@
+python-dotenv
+sqlalchemy
+asyncpg
+psycopg2-binary
+python-multipart
+passlib
+python-jose[cryptography]
+fastapi
+uvicorn
+httpx[http2]
+docker
+pytest
+variamos-security

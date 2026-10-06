@@ -1,0 +1,1476 @@
+import os
+import re
+import logging
+from fastapi import FastAPI, Depends, HTTPException, Request, APIRouter, File, UploadFile
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+from sqlalchemy.orm import Session
+from uvicorn.logging import DefaultFormatter
+from starlette.requests import Request as StarletteRequest
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
+from src.utils.arbol import generate_json, parse_uvl_content
+from src.utils.sxfm_uvl import sxfm_to_uvl
+from variamos_security import (load_keys, is_authenticated, has_roles, has_permissions, SessionUser, VariamosSecurityException, variamos_security_exception_handler)
+from src.utils.conflictJob import run_conflict_auto_resolve_loop
+
+import uuid
+import time
+from typing import Any, Dict, List, Optional, Literal
+from urllib.parse import urlparse
+import httpx
+import asyncio
+import random
+from src.db_connector import get_db, SessionLocal
+from fastapi.middleware.cors import CORSMiddleware
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
+from src.model.modelDAO import UserDao, ProjectDao
+from pydantic import BaseModel, Field
+from src.infrastructure.entry_points import (
+    projects_admin_controller_v1,
+    models_admin_controller_v1,
+    health_controller
+)
+
+
+router = APIRouter(prefix="/api/ai", tags=["ai"])
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+Role = Literal["system", "user", "assistant"]
+# Configure logging
+formatter = DefaultFormatter()
+handler = logging.StreamHandler()
+handler.setFormatter(formatter)
+
+logging.basicConfig(level=logging.DEBUG, handlers=[handler])
+logger = logging.getLogger(__name__)
+logging.getLogger().setLevel(logging.INFO)
+
+for noisy in ("httpx", "httpcore", "hpack", "h2"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
+logger.setLevel(logging.INFO)
+
+class ShareProjectInput(BaseModel):
+    user_email: str
+    project_id: str
+    user_role: str
+
+class ConfigurationInput(BaseModel):
+    project_json: dict
+    id_feature_model: str
+    config_name: str
+    id: str
+
+
+class ConfigurationInput2(BaseModel):
+    id_feature_model: str
+    id: str
+
+class ChangeCollaboratorInput(BaseModel):
+    project_id: str
+
+class ChangeUserRoleInput(BaseModel):
+    project_id: str
+    collaborator_id: str
+    role: str
+
+
+_openrouter_keys: List[str] = []
+_openrouter_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
+_openrouter_last_idx: int = 0
+_openrouter_client: Optional[httpx.AsyncClient] = None
+_conflict_auto_resolve_task: Optional[asyncio.Task] = None
+_openrouter_model_state: Dict[str, float] = {} 
+_model_lock = asyncio.Lock()
+
+def _load_openrouter_keys() -> List[str]:
+    raw = (os.getenv("VARIAMOS_OPENROUTER_API_KEYS")
+           or os.getenv("OPENROUTER_API_KEYS")
+           or "").strip()
+
+    if raw:
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        return keys
+
+    single = (os.getenv("VARIAMOS_OPENROUTER_API_KEY")
+              or os.getenv("OPENROUTER_API_KEY")
+              or "").strip()
+    return [single] if single else []
+
+
+# DeepSeek direct API
+DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+_deepseek_keys: List[str] = []
+_deepseek_key_state: Dict[str, Dict[str, Any]] = {}  # {key: {"cooldown_until": float, "disabled_until": float}}
+_deepseek_last_idx: int = 0
+_deepseek_client: Optional[httpx.AsyncClient] = None
+_deepseek_init_lock = asyncio.Lock()
+
+
+def _load_deepseek_keys() -> List[str]:
+    raw = (os.getenv("VARIAMOS_DEEPSEEK_API_KEYS") or "").strip()
+
+    if raw:
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        return keys
+
+    single = (os.getenv("VARIAMOS_DEEPSEEK_API_KEY") or "").strip()
+    return [single] if single else []
+
+
+OPENROUTER_KEYINFO_URL = "https://openrouter.ai/api/v1/key"
+_openrouter_init_lock = asyncio.Lock()
+
+def _mask_key(k: str) -> str:
+    if not k:
+        return "empty"
+    if len(k) <= 10:
+        return "***"
+    return f"{k[:6]}…{k[-4:]}"
+
+async def _ensure_openrouter_initialized():
+    global _openrouter_keys, _openrouter_client
+
+    if _openrouter_keys and _openrouter_client is not None:
+        return
+
+    async with _openrouter_init_lock:
+        # re-check dentro del lock
+        if not _openrouter_keys:
+            _openrouter_keys = _load_openrouter_keys()
+            logger.info("OpenRouter keys loaded: %d [%s]",
+                        len(_openrouter_keys),
+                        ", ".join(_mask_key(k) for k in _openrouter_keys))
+
+        if _openrouter_client is None:
+            timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+            limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+            _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+            logger.info("OpenRouter client initialized.")
+
+async def _check_key(api_key: str) -> dict:
+    # Verifica que la key realmente sirve
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = await _openrouter_client.get(OPENROUTER_KEYINFO_URL, headers=headers)
+    return {"status": resp.status_code, "body": safe_json(resp)}
+
+
+def _key_available_now(api_key: str, now: float) -> bool:
+    st = _openrouter_key_state.get(api_key, {})
+    cooldown_until = float(st.get("cooldown_until", 0.0) or 0.0)
+    disabled_until = float(st.get("disabled_until", 0.0) or 0.0)
+    return now >= cooldown_until and now >= disabled_until
+
+def _mark_cooldown(api_key: str, seconds: float):
+    now = time.time()
+    st = _openrouter_key_state.setdefault(api_key, {})
+    st["cooldown_until"] = max(float(st.get("cooldown_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+def _mark_disabled(api_key: str, seconds: float):
+    now = time.time()
+    st = _openrouter_key_state.setdefault(api_key, {})
+    st["disabled_until"] = max(float(st.get("disabled_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+
+# DeepSeek key state functions
+def _deepseek_key_available_now(api_key: str, now: float) -> bool:
+    st = _deepseek_key_state.get(api_key, {})
+    cooldown_until = float(st.get("cooldown_until", 0.0) or 0.0)
+    disabled_until = float(st.get("disabled_until", 0.0) or 0.0)
+    return now >= cooldown_until and now >= disabled_until
+
+
+def _deepseek_mark_cooldown(api_key: str, seconds: float):
+    now = time.time()
+    st = _deepseek_key_state.setdefault(api_key, {})
+    st["cooldown_until"] = max(float(st.get("cooldown_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+
+def _deepseek_mark_disabled(api_key: str, seconds: float):
+    now = time.time()
+    st = _deepseek_key_state.setdefault(api_key, {})
+    st["disabled_until"] = max(float(st.get("disabled_until", 0.0) or 0.0), now + max(0.0, seconds))
+
+
+def _deepseek_seconds_until_any_key_available(now: float) -> float:
+    waits = []
+    for k in _deepseek_keys:
+        st = _deepseek_key_state.get(k, {})
+        cd = float(st.get("cooldown_until", 0.0) or 0.0)
+        dis = float(st.get("disabled_until", 0.0) or 0.0)
+        until = max(cd, dis)
+        if until > now:
+            waits.append(until - now)
+    return min(waits) if waits else 0.0
+
+
+def _deepseek_limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
+    lim = _deepseek_free_limiters.get(api_key)
+    if lim is None:
+        lim = SlidingWindowRateLimiter(DEEPSEEK_FREE_RPM, 60.0)
+        _deepseek_free_limiters[api_key] = lim
+    return lim
+
+
+async def _pick_deepseek_key_round_robin(now: float) -> Optional[str]:
+    global _deepseek_last_idx
+
+    if not _deepseek_keys:
+        return None
+
+    n = len(_deepseek_keys)
+
+    async with _deepseek_rr_lock:
+        start = _deepseek_last_idx % n
+        for i in range(n):
+            k = _deepseek_keys[(start + i) % n]
+            if _deepseek_key_available_now(k, now):
+                _deepseek_last_idx = (start + i + 1) % n
+                return k
+
+    return None
+
+
+async def _ensure_deepseek_initialized():
+    global _deepseek_keys, _deepseek_client
+
+    if _deepseek_keys and _deepseek_client is not None:
+        return
+
+    async with _deepseek_init_lock:
+        if not _deepseek_keys:
+            _deepseek_keys = _load_deepseek_keys()
+            logger.info("DeepSeek keys loaded: %d [%s]",
+                        len(_deepseek_keys),
+                        ", ".join(_mask_key(k) for k in _deepseek_keys))
+
+        if _deepseek_client is None:
+            timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+            limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+            _deepseek_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True)
+            logger.info("DeepSeek client initialized.")
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float:
+    ra = resp.headers.get("retry-after")
+    if not ra:
+        return 0.0
+
+    # Caso 1: segundos (string numérico)
+    try:
+        return max(0.0, float(ra))
+    except Exception:
+        pass
+
+    # Caso 2: HTTP-date
+    try:
+        dt = parsedate_to_datetime(ra)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0.0, (dt - now).total_seconds())
+    except Exception:
+        return 0.0
+
+
+def _model_available(model: str, now: float) -> bool:
+    until = _openrouter_model_state.get(model, 0.0)
+    return now >= until
+
+def _mark_model_cooldown(model: str, seconds: float):
+    now = time.time()
+    _openrouter_model_state[model] = max(_openrouter_model_state.get(model, 0.0), now + max(0.0, seconds))
+
+def _build_openrouter_headers(request: Request, api_key: str) -> Dict[str, str]:
+    referer = (request.headers.get("origin") or "https://app.variamos.com")
+    title = "VariaMos"
+
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "HTTP-Referer": referer,
+        "X-Title": title,
+    }
+
+async def _openrouter_post_with_key(payload: Dict[str, Any], request: Request, api_key: str) -> httpx.Response:
+    global _openrouter_client
+    if _openrouter_client is None:
+        raise HTTPException(status_code=500, detail="OpenRouter client not initialized")
+
+    headers = _build_openrouter_headers(request, api_key)
+    return await _openrouter_client.post(OPENROUTER_URL, json=payload, headers=headers)
+
+async def _pick_key_round_robin(now: float) -> Optional[str]:
+    global _openrouter_last_idx
+
+    if not _openrouter_keys:
+        return None
+
+    n = len(_openrouter_keys)
+
+    async with _openrouter_rr_lock:
+        start = _openrouter_last_idx % n
+        for i in range(n):
+            k = _openrouter_keys[(start + i) % n]
+            if _key_available_now(k, now):
+                _openrouter_last_idx = (start + i + 1) % n
+                return k
+
+    return None
+
+def _openrouter_body_error(data: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if isinstance(err, dict) and err.get("message"):
+        return {
+            "code": err.get("code"),
+            "message": err.get("message"),
+            "metadata": err.get("metadata"),
+        }
+    return None
+
+def _as_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+    
+def _normalize_error_code(code: Any, default: int = 500) -> int:
+    if code is None:
+        return default
+    if isinstance(code, int):
+        return code
+    if isinstance(code, str):
+        s = code.strip().lower()
+        if s.isdigit():
+            return int(s)
+        # mapeos comunes
+        if "rate" in s or "limit" in s:
+            return 429
+        if "insufficient" in s or "credit" in s or s == "payment_required":
+            return 402
+        if "unauthorized" in s:
+            return 401
+        if "forbidden" in s:
+            return 403
+        if "bad_request" in s:
+            return 400
+    return default
+
+
+async def _client_gone(request: StarletteRequest) -> bool:
+    try:
+        return await request.is_disconnected()
+    except Exception:
+        return False
+    
+def _filter_models_by_availability(payload: Dict[str, Any], now: float) -> Dict[str, Any]:
+    # construye lista candidata
+    candidates: List[str] = []
+    if isinstance(payload.get("models"), list):
+        candidates = [m for m in payload["models"] if isinstance(m, str)]
+    elif isinstance(payload.get("model"), str):
+        candidates = [payload["model"]]
+
+    # filtra por cooldown
+    available = [m for m in candidates if _model_available(m, now)]
+    if not available:
+        return {}
+
+    # reconstruye payload consistente
+    p2 = dict(payload)
+    p2["model"] = available[0]
+    if len(available) > 1:
+        p2["models"] = available
+        p2["route"] = "fallback"
+    else:
+        p2.pop("models", None)
+        p2.pop("route", None)
+    return p2
+
+
+def _seconds_until_any_model_available(payload: Dict[str, Any], now: float) -> float:
+    candidates: List[str] = []
+    if isinstance(payload.get("models"), list):
+        candidates = [m for m in payload["models"] if isinstance(m, str)]
+    elif isinstance(payload.get("model"), str):
+        candidates = [payload["model"]]
+
+    waits = []
+    for m in candidates:
+        until = _openrouter_model_state.get(m, 0.0)
+        if until > now:
+            waits.append(until - now)
+    return min(waits) if waits else 0.0
+
+def _candidate_models(payload: Dict[str, Any]) -> List[str]:
+    ms = payload.get("models")
+    if isinstance(ms, list) and ms:
+        return [m for m in ms if isinstance(m, str)]
+    m = payload.get("model")
+    return [m] if isinstance(m, str) else []
+    
+
+
+
+def _backoff_seconds(attempt_idx: int, base: float = 1.0, cap: float = 12.0) -> float:
+    t = min(cap, base * (2 ** attempt_idx))
+    # jitter +-25%
+    return t * (0.75 + random.random() * 0.5)
+
+
+def _openrouter_any_error(data: Any) -> Optional[Dict[str, Any]]:
+    """
+    OpenRouter a veces responde HTTP 200 pero con error:
+      - error top-level: {"error": {...}}
+      - error dentro de choices[0]: {"choices":[{"error": {...}, ...}]}
+      - error dentro de choices[0].message: {"choices":[{"message":{"error": {...}}}]}
+    Retorna dict normalizado: {where, code, message, metadata, raw}
+    """
+    if not isinstance(data, dict):
+        return None
+
+    # 1) Top-level error
+    err = data.get("error")
+    if isinstance(err, dict) and (err.get("message") or err.get("code") is not None):
+        return {
+            "where": "top_level",
+            "code": err.get("code"),
+            "message": err.get("message") or "",
+            "metadata": err.get("metadata"),
+            "raw": err,
+        }
+
+    # 2) choices-level
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        c0 = choices[0] if isinstance(choices[0], dict) else {}
+
+        c0_err = c0.get("error")
+        if isinstance(c0_err, dict) and (c0_err.get("message") or c0_err.get("code") is not None):
+            return {
+                "where": "choices[0].error",
+                "code": c0_err.get("code"),
+                "message": c0_err.get("message") or "",
+                "metadata": c0_err.get("metadata"),
+                "raw": c0_err,
+            }
+
+        msg = c0.get("message")
+        if isinstance(msg, dict):
+            msg_err = msg.get("error")
+            if isinstance(msg_err, dict) and (msg_err.get("message") or msg_err.get("code") is not None):
+                return {
+                    "where": "choices[0].message.error",
+                    "code": msg_err.get("code"),
+                    "message": msg_err.get("message") or "",
+                    "metadata": msg_err.get("metadata"),
+                    "raw": msg_err,
+                }
+
+    return None
+
+async def call_openrouter_best_effort(payload: Dict[str, Any], request: Request) -> Dict[str, Any]:
+    """
+    1 sola llamada a OpenRouter por request.
+    - Usa round-robin para elegir key disponible
+    - Si la respuesta indica problema de API key (401/403/402 o mensaje tipo invalid key),
+      marca esa key como disabled para que la PRÓXIMA request rote.
+    - IMPORTANTÍSIMO: 429 "upstream/provider rate limit" NO debe enfriar (cooldown) la KEY,
+      porque no es culpa de la key y te quedas sin keys disponibles.
+      En ese caso, se enfría el MODELO (model cooldown) y se devuelve 429 al front con retryAfter.
+    - Log completo de: payload enviado, headers enviados (sin Authorization real),
+      status/headers/body recibidos.
+    """
+    await _ensure_openrouter_initialized()
+    if not _openrouter_keys:
+        raise HTTPException(status_code=500, detail={"error": {"message": "No OpenRouter API keys configured"}})
+
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
+    model = model.strip()
+
+    payload2: Dict[str, Any] = {
+        "model": model,
+        "messages": payload.get("messages") or [],
+        "stream": False,
+    }
+    if isinstance(payload.get("user"), str) and payload["user"].strip():
+        payload2["user"] = payload["user"].strip()
+
+    MAX_BODY_LOG_CHARS = 1_000_000  # si de verdad quieres "todo", sube esto (ojo tamaño logs)
+
+    def _truncate_text(s: Any, limit: int) -> str:
+        try:
+            txt = s if isinstance(s, str) else str(s)
+        except Exception:
+            txt = "<unprintable>"
+        if limit <= 0:
+            return txt
+        return txt if len(txt) <= limit else (txt[:limit] + "…[truncated]")
+
+    def _mask_headers_for_log(h: Dict[str, str]) -> Dict[str, str]:
+        hh = dict(h or {})
+        if "Authorization" in hh:
+            hh["Authorization"] = "Bearer ***"
+        return hh
+
+    def _extract_err_fields(body: Any) -> Dict[str, Any]:
+        # Intenta extraer {code,message,metadata} de body error
+        if not isinstance(body, dict):
+            return {}
+        err = body.get("error")
+        if not isinstance(err, dict):
+            return {}
+        return {
+            "code": err.get("code"),
+            "message": err.get("message"),
+            "metadata": err.get("metadata"),
+        }
+
+    def _is_key_credential_error(status_code: int, body: Any) -> bool:
+        # 401/403/402 => (opcional) marca disabled
+        if status_code in (401, 403, 402):
+            return True
+
+        # Algunos 200 traen error embebido, pero aquí usamos para no-200 principalmente.
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                code = err.get("code")
+                msg = str(err.get("message") or "").lower()
+                if isinstance(code, int) and code in (401, 403, 402):
+                    return True
+                # Heurística de "invalid key"
+                if ("key" in msg or "token" in msg or "apikey" in msg or "api key" in msg) and (
+                    "invalid" in msg or "unauthorized" in msg or "forbidden" in msg or "rejected" in msg or "missing" in msg
+                ):
+                    return True
+        return False
+
+    def _is_provider_upstream_429(body: Any) -> bool:
+        """
+        Detecta el caso que te está pegando:
+          {"error":{"message":"Provider returned error","code":429,"metadata":{"raw":"...temporarily rate-limited upstream...", "provider_name":"Venice","is_byok":false}}}
+        Esto NO depende de tu key, así que NO hay que enfriar la key.
+        """
+        if not isinstance(body, dict):
+            return False
+        err = body.get("error")
+        if not isinstance(err, dict):
+            return False
+
+        code = err.get("code")
+        if code != 429:
+            return False
+
+        meta = err.get("metadata")
+        provider_name = None
+        raw = ""
+        if isinstance(meta, dict):
+            provider_name = meta.get("provider_name")
+            raw = str(meta.get("raw") or "").lower()
+
+        msg = str(err.get("message") or "").lower()
+
+        # Señales fuertes de "provider upstream throttle"
+        if provider_name:
+            return True
+        if "temporarily rate-limited upstream" in raw:
+            return True
+        if "provider returned error" in msg and ("upstream" in raw or "rate-limited" in raw):
+            return True
+
+        return False
+
+    # --- pick key ---
+    now_epoch = time.time()
+    api_key = await _pick_key_round_robin(now_epoch)
+    if not api_key:
+        wait_s = _seconds_until_any_key_available(time.time()) or 1.0
+        raise HTTPException(
+            status_code=429,
+            detail={"error": {"message": "No API key available (cooldown/disabled)", "retryAfter": wait_s}},
+            headers={"Retry-After": str(int(max(1.0, wait_s)))},
+        )
+
+    # throttle local para free
+    if model.endswith(":free"):
+        await _free_global_limiter.acquire()
+        await _limiter_for_key(api_key).acquire()
+
+    headers = _build_openrouter_headers(request, api_key)
+    headers_log = _mask_headers_for_log(headers)
+
+    # --- LOG SEND ---
+    logger.info("[openrouter][SEND] url=%s", OPENROUTER_URL)
+    logger.info("[openrouter][SEND] model=%s key=%s", model, _mask_key(api_key))
+    logger.info("[openrouter][SEND] headers=%s", headers_log)
+    logger.info("[openrouter][SEND] payload=%s", payload2)
+
+    t0 = time.time()
+    try:
+        async with _openrouter_sem:
+            resp = await _openrouter_client.post(OPENROUTER_URL, json=payload2, headers=headers)
+    except httpx.TimeoutException as e:
+        _mark_cooldown(api_key, 3.0)
+        logger.exception("[openrouter][RECV] TIMEOUT key=%s err=%s", _mask_key(api_key), str(e))
+        raise HTTPException(status_code=504, detail={"error": {"message": "OpenRouter timeout", "exception": str(e)}})
+    except httpx.RequestError as e:
+        _mark_cooldown(api_key, 3.0)
+        logger.exception("[openrouter][RECV] NETWORK_ERROR key=%s err=%s", _mask_key(api_key), str(e))
+        raise HTTPException(status_code=502, detail={"error": {"message": "Network error to OpenRouter", "exception": str(e)}})
+
+    elapsed = time.time() - t0
+    raw_text = ""
+    try:
+        raw_text = resp.text
+    except Exception:
+        raw_text = "<unable to read resp.text>"
+
+    logger.info("[openrouter][RECV] status=%s elapsed=%.3fs model=%s key=%s retry-after=%s",
+                resp.status_code, elapsed, model, _mask_key(api_key), resp.headers.get("retry-after"))
+    logger.info("[openrouter][RECV] headers=%s", dict(resp.headers))
+    logger.info("[openrouter][RECV] body_raw=%s", _truncate_text(raw_text, MAX_BODY_LOG_CHARS))
+
+    body = safe_json(resp)
+
+    # --- HTTP != 200 ---
+    if resp.status_code != 200:
+        # Si es 429, distinguir provider-upstream vs key/OpenRouter
+        if resp.status_code == 429:
+            wait_s = _retry_after_seconds(resp) or 8.0
+
+            if _is_provider_upstream_429(body):
+                #  FIX: NO enfriar key; enfriar modelo
+                _mark_model_cooldown(model, wait_s)
+            else:
+                # 429 más "clásico" (por key / gateway): enfriar key + modelo
+                _mark_cooldown(api_key, wait_s)
+                _mark_model_cooldown(model, wait_s)
+
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": {"message": "Upstream OpenRouter error", "status": 429, "model": model, "retryAfter": wait_s},
+                    "upstream": body,
+                },
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+            )
+
+        # Credenciales/credits: marcar disabled (temporal)
+        if _is_key_credential_error(resp.status_code, body):
+            # con 3 keys, mejor “sacar” la key rota por un buen rato
+            _mark_disabled(api_key, 6 * 3600)  # 6 horas (ajusta)
+            logger.warning("[openrouter] key disabled for next requests: %s (status=%s)", _mask_key(api_key), resp.status_code)
+
+        # Otros errores: cooldown corto para evitar loops
+        _mark_cooldown(api_key, 3.0)
+
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail={
+                "error": {"message": "Upstream OpenRouter error", "status": resp.status_code, "model": model},
+                "upstream": body,
+            },
+        )
+
+    # --- HTTP 200 pero con error embebido ---
+    or_err = _openrouter_any_error(body) if isinstance(body, dict) else None
+    if or_err:
+        code = _normalize_error_code(or_err.get("code"), 502)
+        err_msg = str(or_err.get("message") or "OpenRouter embedded error")
+
+        if code == 429:
+            wait_s = _retry_after_seconds(resp) or 8.0
+            # mismo criterio: provider-upstream vs key
+            if _is_provider_upstream_429(body):
+                _mark_model_cooldown(model, wait_s)
+            else:
+                _mark_cooldown(api_key, wait_s)
+                _mark_model_cooldown(model, wait_s)
+
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"message": err_msg, "retryAfter": wait_s, "model": model}, "upstream": body},
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+            )
+
+        if _is_key_credential_error(code, body):
+            _mark_disabled(api_key, 6 * 3600)
+
+        _mark_cooldown(api_key, 3.0)
+        raise HTTPException(
+            status_code=502,
+            detail={"error": {"message": err_msg, "where": or_err.get("where"), "metadata": or_err.get("metadata")}, "upstream": body},
+        )
+
+    return body
+
+
+app = FastAPI()
+
+raw_patterns = [p.strip() for p in os.getenv("VARIAMOS_CORS_ALLOWED_ORIGINS_PATTERNS", "").split(",") if p.strip()]
+ALLOWED_ORIGINS_PATTERNS = []
+for p in raw_patterns:
+    try:
+        ALLOWED_ORIGINS_PATTERNS.append(re.compile(p))
+    except re.error as e:
+        logger.error(f"Invalid CORS origin regex: {p} -> {e}")
+
+
+class CustomCORSMiddleware(CORSMiddleware):
+    def is_allowed_origin(self, origin: str) -> bool:
+        if not origin or origin == "null":
+            return False
+        if not ALLOWED_ORIGINS_PATTERNS:
+            return False
+        return any(p.match(origin) for p in ALLOWED_ORIGINS_PATTERNS)
+
+
+app.add_middleware(
+    CustomCORSMiddleware,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+app.add_exception_handler(VariamosSecurityException, variamos_security_exception_handler)
+app.include_router(health_controller)
+app.include_router(projects_admin_controller_v1)
+app.include_router(models_admin_controller_v1)
+
+def enforce_allowed_web_origin(request: Request):
+    if not ALLOWED_ORIGINS_PATTERNS:
+        raise HTTPException(status_code=403, detail="CORS origins not configured")
+
+    origin = (request.headers.get("origin") or "").strip()
+    referer = (request.headers.get("referer") or "").strip()
+
+    candidate = ""
+    if origin:
+        candidate = origin
+    elif referer:
+        try:
+            u = urlparse(referer)
+            if u.scheme and u.netloc:
+                candidate = f"{u.scheme}://{u.netloc}"
+        except Exception:
+            candidate = ""
+
+    if not candidate or candidate == "null":
+        raise HTTPException(status_code=403, detail="Forbidden origin")
+
+    if not any(p.match(candidate) for p in ALLOWED_ORIGINS_PATTERNS):
+        raise HTTPException(status_code=403, detail="Forbidden origin")
+    
+def uvl_to_json(input_data):
+    elements, relationships = parse_uvl_content(input_data)
+    json_data = generate_json(elements, relationships)
+    #print(json_data)
+    return json_data
+
+
+def sxfm_uvl(sxfm_data):
+    uvl_content = sxfm_to_uvl(sxfm_data)
+    return uvl_to_json(uvl_content)
+
+
+@app.post("/process-file")
+async def process_file(file: UploadFile = File(...)):
+    content = await file.read()
+    content = content.decode('utf-8')
+    # Determina si el contenido es UVL o SXFM
+    if file.filename.endswith('.uvl'):
+        json_data = uvl_to_json(content)
+        return Response(content=json_data, media_type="application/json")
+    elif file.filename.endswith('.xml'):
+        json_data = sxfm_uvl(content)
+        return Response(content=json_data, media_type="application/json")
+    elif file.filename.endswith('.json'):
+        return Response(content=content, media_type="application/json")
+    else:
+        return {"error": "Unsupported file format"}
+
+
+@app.get("/version")
+async def getVersion():
+    return {"transactionId": "1", "message": "vms_projects 1.25.3.20.21"}
+
+@app.get("/testdb")
+async def testDb():
+    return project_DAO.get_template_projects()
+
+@app.on_event("startup")
+async def iniciar_app():
+    print("Se está inicializando la conexión con la base de datos")
+    db = SessionLocal()
+    global user_DAO
+    global project_DAO
+    user_DAO = UserDao(db)
+    project_DAO = ProjectDao(db)
+    load_keys()
+    global _openrouter_keys, _openrouter_client
+    try:
+        _openrouter_keys = _load_openrouter_keys()
+        if not _openrouter_keys:
+            logger.warning("No OpenRouter keys configured (proxy will fail).")
+
+        timeout = httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0)
+        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20)
+        _openrouter_client = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False)
+        logger.info("OpenRouter client initialized.")
+    except Exception as e:
+        _openrouter_client = None
+        _openrouter_keys = []
+        logger.exception(f"OpenRouter init failed (service will still run): {e}")
+    await _ensure_openrouter_initialized()
+    
+    global _conflict_auto_resolve_task
+    _conflict_auto_resolve_task = asyncio.create_task(run_conflict_auto_resolve_loop())
+    logger.info("Conflict auto-resolve background task started.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _openrouter_client, _conflict_auto_resolve_task
+    try:
+        if _openrouter_client is not None:
+            await _openrouter_client.aclose()
+    finally:
+        if _conflict_auto_resolve_task is not None:
+            _conflict_auto_resolve_task.cancel()
+        close_db()
+
+
+
+def close_db():
+    db = SessionLocal()  # Aquí obtienes la sesión
+    db.close()
+
+
+@app.get("/getUser", dependencies=[Depends(is_authenticated)])
+async def obtener_usuario(request: Request):
+    user = request.state.user
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"data": {"user": user}}
+
+@app.post("/saveProject", dependencies=[Depends(is_authenticated)])
+async def guardar_modelo(request: Request, project_dict: dict):
+    template=False
+    user_id = request.state.user.id
+    print("intento guardar modelo")
+    project_id=project_dict['id']
+    if project_id == None:
+        print("project id is none")
+        return project_DAO.create_project(project_dict, user_id)
+    else:
+        print("project is updated")
+        return project_DAO.update_project(project_dict, user_id)
+
+
+@app.get("/getProjects", dependencies=[Depends(is_authenticated)])
+async def obtener_modelos(request: Request):
+    user_id = request.state.user.id
+
+    all_projects = user_DAO.get_projects(user_id)["data"]["projects"]
+    
+    owned_proyects = [project for project in all_projects if project["role"] == "owner"]
+    shared_proyects = [
+        project for project in all_projects
+          if project["role"] != "owner"
+          and project["is_collaborative"] == True
+    ]
+
+    return {
+        "owned_projects": owned_proyects,
+        "shared_projects": shared_proyects
+    }
+
+@app.get("/getTemplateProjects", dependencies=[Depends(is_authenticated)])
+async def obtener_modelos_template():
+    return project_DAO.get_template_projects()
+
+@app.get("/getProject", dependencies=[Depends(is_authenticated)])
+async def obtener_modelo(request: Request, project_id: str):
+    user_id = request.state.user.id
+    return project_DAO.get_by_id(user_id, project_id)
+
+
+@app.post("/shareProject", dependencies=[Depends(is_authenticated)])
+async def compartir_modelo(data: ShareProjectInput):
+
+    user = user_DAO.get_by_email(data.user_email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return project_DAO.share_project(data.project_id, user.id, data.user_role)
+
+@app.get("/usersProject", dependencies=[Depends(is_authenticated)])
+async def obtener_usuarios_proyecto(request: Request, project_id: str):
+    user_id = request.state.user.id
+    return project_DAO.get_users(project_id, user_id)
+
+@app.delete("/removeCollaborator", dependencies=[Depends(is_authenticated)])
+async def delete_collaborator_endpoint(request: Request, project_id: str, collaborator_id: str):
+    user_id = request.state.user.id
+    return project_DAO.delete_collaborator(project_id, user_id, collaborator_id)
+
+@app.post("/changeUserRole", dependencies=[Depends(is_authenticated)])
+async def cambiar_rol_usuario(request: Request, data: ChangeUserRoleInput):
+    user_id = request.state.user.id
+    return project_DAO.change_user_role(data.project_id, user_id, data.collaborator_id, data.role)
+
+@app.post("/changeProjectCollaborative", dependencies=[Depends(is_authenticated)])
+async def cambiar_colaborativo(request: Request, data: ChangeCollaboratorInput):
+    user_id = request.state.user.id
+    return project_DAO.change_project_collaborative(data.project_id, user_id)
+
+@app.get("/getUserRole", dependencies=[Depends(is_authenticated)])
+async def obtener_rol_usuario(request: Request, project_id: str):
+    user_id = request.state.user.id
+    return project_DAO.get_user_role(project_id, user_id)
+
+@app.get("/findUser")
+async def buscar_usuario_email(user_mail: str, db: Session = Depends(get_db)):
+    return user_DAO.get_by_email(user_mail)
+
+
+@app.get("/permissionProject")
+async def obtener_permisos(project_id: str, db: Session = Depends(get_db)):
+    return None
+
+@app.put("/updateProjectName", dependencies=[Depends(is_authenticated)])
+async def update_project_name_endpoint(project_dict: dict):
+    return project_DAO.update_project_name(project_dict)
+
+@app.delete("/deleteProject", dependencies=[Depends(is_authenticated)])
+async def delete_project_endpoint(project_dict: dict):
+    return project_DAO.delete_project(project_dict)
+
+@app.post("/addConfiguration", dependencies=[Depends(is_authenticated)])
+def add_configuration(project_id: str, config_input: ConfigurationInput):
+    try:
+        return project_DAO.add_configuration(project_id, config_input.project_json, config_input.id_feature_model, config_input.config_name)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/deleteConfiguration", dependencies=[Depends(is_authenticated)])
+def delete_configuration(project_id: str, model_id : str, configuration_id: str):
+    try:
+        return project_DAO.delete_configuration_from_project(project_id, model_id, configuration_id)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/getConfiguration", dependencies=[Depends(is_authenticated)])
+def get_configuration(project_id: str, configuration_id: str):
+    return project_DAO.get_configuration(project_id, configuration_id)
+
+@app.get("/getAllConfigurations", dependencies=[Depends(is_authenticated)])
+def get_model_configurations(project_id: str, model_id: str):
+    return project_DAO.get_model_configurations(project_id, model_id)
+
+@app.post("/applyConfiguration2", dependencies=[Depends(is_authenticated)])
+def apply_configuration2(project_id : str, model_id : str, configuration_id: str):
+    return project_DAO.apply_configuration(project_id, model_id, configuration_id)
+
+@app.post("/applyConfiguration", dependencies=[Depends(is_authenticated)])
+def apply_configuration(project_id : str, config_input: ConfigurationInput2):
+    return project_DAO.apply_configuration(project_id, config_input.id_feature_model, config_input.id)
+
+@app.post("/projectHistory", dependencies=[Depends(is_authenticated)])
+async def register_history_event(request: Request, history_data: dict, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.create_history(history_data, user_id)
+
+@app.get("/projectHistory", dependencies=[Depends(is_authenticated)])
+async def get_project_history(project_id: str, request: Request, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.get_history(project_id, user_id)
+
+@app.post("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def create_annotation(request: Request,annotation_data: dict,db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.create_annotation(annotation_data, user_id)
+
+@app.get("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def get_annotations(model_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.get_annotations(model_id)
+
+@app.delete("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def delete_annotation(annotation_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.delete_annotation(annotation_id)
+
+@app.put("/projectAnnotation/resolve", dependencies=[Depends(is_authenticated)])
+async def resolve_annotation(annotation_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.resolve_annotation(annotation_id)
+
+@app.put("/projectAnnotation/unresolve", dependencies=[Depends(is_authenticated)])
+async def unresolve_annotation(annotation_id: str, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.unresolve_annotation(annotation_id)
+
+@app.put("/projectAnnotation", dependencies=[Depends(is_authenticated)])
+async def update_annotation(annotation_id: str, annotation_data: dict, db: Session = Depends(get_db)):
+    project_DAO = ProjectDao(db)
+    return project_DAO.update_annotation(annotation_id, annotation_data)
+
+@app.post("/projectConflict", dependencies=[Depends(is_authenticated)])
+async def create_conflict(request: Request, conflict_data: dict, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.create_conflict(conflict_data, user_id)
+
+@app.get("/projectConflict", dependencies=[Depends(is_authenticated)])
+async def get_conflicts(request: Request, project_id: str, model_id: str = None, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.get_conflicts(project_id, user_id, model_id)
+
+@app.post("/projectConflict/change", dependencies=[Depends(is_authenticated)])
+async def add_conflict_change(request: Request, conflict_id: str, change_data: dict, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.add_conflict_change(conflict_id, user_id, change_data.get("proposedValue"), change_data.get("operation"))
+
+@app.post("/projectConflict/vote", dependencies=[Depends(is_authenticated)])
+async def vote_conflict(request: Request, conflict_id: str, field_name: str, change_id: str, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.vote_conflict(conflict_id, user_id, field_name, change_id)
+
+@app.put("/projectConflict/resolve", dependencies=[Depends(is_authenticated)])
+async def resolve_conflict(request: Request, conflict_id: str, db: Session = Depends(get_db)):
+    user_id = request.state.user.id
+    project_DAO = ProjectDao(db)
+    return project_DAO.resolve_conflict(conflict_id, user_id)
+    
+from collections import deque
+
+OPENROUTER_MAX_CONCURRENCY = 3   
+OPENROUTER_MAX_ATTEMPTS = 1      
+OPENROUTER_MAX_TOTAL_WAIT_S = 300
+OPENROUTER_FREE_RPM = 10         
+OPENROUTER_FREE_GLOBAL_RPM = 20  
+
+
+_openrouter_sem = asyncio.Semaphore(OPENROUTER_MAX_CONCURRENCY)
+_openrouter_rr_lock = asyncio.Lock()
+
+class SlidingWindowRateLimiter:
+    def __init__(self, max_calls: int, window_seconds: float):
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self._lock = asyncio.Lock()
+        self._calls = deque()
+
+    async def acquire(self):
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                # limpia llamadas viejas
+                while self._calls and (now - self._calls[0]) >= self.window_seconds:
+                    self._calls.popleft()
+
+                if len(self._calls) < self.max_calls:
+                    self._calls.append(now)
+                    return
+
+                wait_s = self.window_seconds - (now - self._calls[0])
+
+            await asyncio.sleep(max(0.0, wait_s))
+
+_free_rpm_limiters: Dict[str, SlidingWindowRateLimiter] = {}
+_free_global_limiter = SlidingWindowRateLimiter(OPENROUTER_FREE_GLOBAL_RPM, 60.0)
+
+# DeepSeek rate limiting (same pattern as OpenRouter)
+DEEPSEEK_MAX_CONCURRENCY = 3
+DEEPSEEK_FREE_RPM = 10
+DEEPSEEK_FREE_GLOBAL_RPM = 20
+
+_deepseek_sem = asyncio.Semaphore(DEEPSEEK_MAX_CONCURRENCY)
+_deepseek_rr_lock = asyncio.Lock()
+_deepseek_free_limiters: Dict[str, SlidingWindowRateLimiter] = {}
+_deepseek_free_global_limiter = SlidingWindowRateLimiter(DEEPSEEK_FREE_GLOBAL_RPM, 60.0)
+
+def _limiter_for_key(api_key: str) -> SlidingWindowRateLimiter:
+    lim = _free_rpm_limiters.get(api_key)
+    if lim is None:
+        lim = SlidingWindowRateLimiter(OPENROUTER_FREE_RPM, 60.0)
+        _free_rpm_limiters[api_key] = lim
+    return lim
+
+def _payload_uses_free_models(payload: Dict[str, Any]) -> bool:
+    ms = payload.get("models")
+    if isinstance(ms, list) and ms:
+        return any(isinstance(m, str) and m.endswith(":free") for m in ms)
+    m = payload.get("model")
+    return isinstance(m, str) and m.endswith(":free")
+
+
+class ChatMessage(BaseModel):
+    role: Role
+    content: str
+
+class AIChatRequest(BaseModel):
+    primaryModelId: str = Field(..., min_length=1)
+    fallbackModelIds: List[str] = []
+    messages: List[ChatMessage] = Field(..., min_length=1)
+
+class AIChatResult(BaseModel):
+    content: str
+    usedModelId: str
+
+@router.get("/_debug/openrouter", dependencies=[Depends(is_authenticated)])
+async def debug_openrouter():
+    await _ensure_openrouter_initialized()
+    info = []
+    for k in _openrouter_keys:
+        try:
+            r = await _check_key(k)
+        except Exception as e:
+            r = {"status": "error", "body": str(e)}
+        info.append({"key": _mask_key(k), "check": r})
+    return {
+        "keys_loaded": len(_openrouter_keys),
+        "client_ready": _openrouter_client is not None,
+        "keys": info,
+    }
+
+
+@router.get("/_debug/deepseek", dependencies=[Depends(is_authenticated)])
+async def debug_deepseek():
+    await _ensure_deepseek_initialized()
+    info = []
+    for k in _deepseek_keys:
+        try:
+            r = {"status": "configured", "note": "DeepSeek has no key validation endpoint"}
+        except Exception as e:
+            r = {"status": "error", "body": str(e)}
+        info.append({"key": _mask_key(k), "check": r})
+    return {
+        "keys_loaded": len(_deepseek_keys),
+        "client_ready": _deepseek_client is not None,
+        "keys": info,
+        "rate_limits": {
+            "free_rpm_per_key": DEEPSEEK_FREE_RPM,
+            "free_global_rpm": DEEPSEEK_FREE_GLOBAL_RPM,
+            "max_concurrency": DEEPSEEK_MAX_CONCURRENCY,
+        },
+        "key_states": {
+            _mask_key(k): {
+                "cooldown_until": st.get("cooldown_until", 0),
+                "disabled_until": st.get("disabled_until", 0),
+            }
+            for k, st in _deepseek_key_state.items()
+        }
+    }
+
+def safe_json(resp: httpx.Response):
+    try:
+        return resp.json()
+    except Exception:
+        try:
+            return resp.text
+        except Exception:
+            return "<unable to read response body>"
+
+
+def _seconds_until_any_key_available(now: float) -> float:
+    waits = []
+    for k in _openrouter_keys:
+        st = _openrouter_key_state.get(k, {})
+        cd = float(st.get("cooldown_until", 0.0) or 0.0)
+        dis = float(st.get("disabled_until", 0.0) or 0.0)
+        until = max(cd, dis)
+        if until > now:
+            waits.append(until - now)
+    return min(waits) if waits else 0.0
+
+
+def _truncate(s: str, n: int = 300) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.replace("\n", "\\n")
+    return s[:n] + ("…" if len(s) > n else "")
+
+def _summarize_openrouter_data(data: Any) -> dict:
+    """
+    Resumen seguro y chico (para logs) del response de OpenRouter.
+    No loguea contenido completo ni metadata gigante.
+    """
+    if not isinstance(data, dict):
+        return {"type": type(data).__name__}
+
+    summary: Dict[str, Any] = {
+        "keys": list(data.keys())[:25],
+        "model": data.get("model"),
+    }
+
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        summary["choices_len"] = len(choices)
+        if choices:
+            c0 = choices[0] if isinstance(choices[0], dict) else {}
+            msg = c0.get("message") if isinstance(c0.get("message"), dict) else None
+            if msg is None and isinstance(c0.get("delta"), dict):
+                msg = c0.get("delta")
+
+            raw_content = None
+            if isinstance(msg, dict):
+                raw_content = msg.get("content")
+                # Choice-level error
+            if isinstance(choices, list) and choices:
+                c0 = choices[0] if isinstance(choices[0], dict) else {}
+                c0err = c0.get("error")
+                if isinstance(c0err, dict):
+                    summary["choice0_error"] = {
+                        "code": c0err.get("code"),
+                        "message": _truncate(str(c0err.get("message") or ""), 250),
+                    }
+                    meta = c0err.get("metadata")
+                    if meta is not None:
+                        summary["choice0_error_meta_preview"] = _truncate(str(meta), 400)
+
+
+            summary["choice0_keys"] = list(c0.keys())[:25]
+            summary["raw_content_type"] = type(raw_content).__name__
+
+            # preview del texto parseado (sin romper si falla)
+            try:
+                parsed = extract_text_content(data)
+                summary["parsed_len"] = len(parsed or "")
+                summary["parsed_preview"] = _truncate(parsed or "", 250)
+            except Exception as e:
+                summary["parsed_error"] = str(e)[:200]
+
+    # Si viene error embebido
+    err = data.get("error")
+    if isinstance(err, dict):
+        summary["error"] = {
+            "code": err.get("code"),
+            "message": _truncate(str(err.get("message") or ""), 250),
+        }
+
+    return summary
+
+
+def extract_used_model(data: dict, fallback: str = "unknown") -> str:
+    if not isinstance(data, dict):
+        return fallback
+    m = data.get("model")
+    if isinstance(m, str) and m.strip():
+        return m.strip()
+
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        ch0 = choices[0] if isinstance(choices[0], dict) else {}
+        m2 = ch0.get("model")
+        if isinstance(m2, str) and m2.strip():
+            return m2.strip()
+
+        msg = ch0.get("message") if isinstance(ch0.get("message"), dict) else {}
+        m3 = msg.get("model")
+        if isinstance(m3, str) and m3.strip():
+            return m3.strip()
+
+    return fallback
+
+def extract_text_content(data: dict) -> str:
+    if not isinstance(data, dict):
+        logger.warning("[openrouter] data is not dict: %s", type(data))
+        return ""
+
+    choices = data.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        ot = data.get("output_text")
+        if isinstance(ot, str) and ot.strip():
+            return ot.strip()
+
+        logger.warning("[openrouter] no choices. keys=%s", sorted(list(data.keys()))[:30])
+        return ""
+
+    c0 = choices[0] if isinstance(choices[0], dict) else {}
+    # OpenAI-style
+    msg = c0.get("message")
+    if msg is None:
+        msg = c0.get("delta")
+
+    if msg is None:
+        txt = c0.get("text")
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+        msg = {}
+
+    # msg debería ser dict
+    if not isinstance(msg, dict):
+        logger.warning("[openrouter] message/delta not dict. type=%s", type(msg))
+        return ""
+
+    c = msg.get("content")
+
+    # Caso normal: string
+    if isinstance(c, str):
+        return c.strip()
+
+    # Caso: lista de partes [{type:"text", text:"..."}]
+    if isinstance(c, list):
+        parts = []
+        for item in c:
+            if isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str) and t.strip():
+                    parts.append(t.strip())
+        return "\n".join(parts).strip()
+
+    # Caso: dict con text
+    if isinstance(c, dict):
+        t = c.get("text")
+        if isinstance(t, str) and t.strip():
+            return t.strip()
+
+    # Caso: algunos devuelven output_text
+    ot = data.get("output_text")
+    if isinstance(ot, str) and ot.strip():
+        return ot.strip()
+
+    return ""
+
+
+async def _call_provider(payload: Dict[str, Any], request: Request, provider: str) -> Dict[str, Any]:
+    """Call the appropriate provider based on provider name."""
+    if provider == "deepseek":
+        await _ensure_deepseek_initialized()
+        if not _deepseek_keys:
+            raise HTTPException(status_code=500, detail={"error": {"message": "DeepSeek API key not configured"}})
+
+        model = payload.get("model", "")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(status_code=400, detail={"error": {"message": "Missing 'model' in payload"}})
+        model = model.strip()
+
+        # Pick key round-robin
+        now_epoch = time.time()
+        api_key = await _pick_deepseek_key_round_robin(now_epoch)
+        if not api_key:
+            wait_s = _deepseek_seconds_until_any_key_available(now_epoch) or 1.0
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"message": "No DeepSeek API key available (cooldown/disabled)", "retryAfter": wait_s}},
+                headers={"Retry-After": str(int(max(1.0, wait_s)))},
+            )
+
+        # Rate limiting for free models
+        is_free = model.endswith(":free")
+        if is_free:
+            await _deepseek_free_global_limiter.acquire()
+            await _deepseek_limiter_for_key(api_key).acquire()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        logger.info("[deepseek][SEND] model=%s key=%s", model, _mask_key(api_key))
+        logger.debug("[deepseek][SEND] payload=%s", payload)
+
+        try:
+            async with _deepseek_sem:
+                resp = await _deepseek_client.post(DEEPSEEK_URL, json=payload, headers=headers)
+        except httpx.TimeoutException as e:
+            _deepseek_mark_cooldown(api_key, 3.0)
+            logger.exception("[deepseek][RECV] TIMEOUT key=%s err=%s", _mask_key(api_key), str(e))
+            raise HTTPException(status_code=504, detail={"error": {"message": "DeepSeek timeout", "exception": str(e)}})
+        except httpx.RequestError as e:
+            _deepseek_mark_cooldown(api_key, 3.0)
+            logger.exception("[deepseek][RECV] NETWORK_ERROR key=%s err=%s", _mask_key(api_key), str(e))
+            raise HTTPException(status_code=502, detail={"error": {"message": "Network error to DeepSeek", "exception": str(e)}})
+
+        raw_text = resp.text
+        logger.info("[deepseek][RECV] status=%s model=%s key=%s retry-after=%s",
+                    resp.status_code, model, _mask_key(api_key), resp.headers.get("retry-after"))
+        logger.debug("[deepseek][RECV] body_raw=%s", raw_text)
+
+        body = safe_json(resp)
+
+        if resp.status_code != 200:
+            # Handle rate limits similar to OpenRouter
+            if resp.status_code == 429:
+                wait_s = _retry_after_seconds(resp) or 8.0
+                _deepseek_mark_cooldown(api_key, wait_s)
+                if is_free:
+                    _mark_model_cooldown(model, wait_s)
+
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": {"message": "DeepSeek rate limit", "status": 429, "model": model, "retryAfter": wait_s},
+                        "upstream": body,
+                    },
+                    headers={"Retry-After": str(int(max(1.0, wait_s)))},
+                )
+
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={
+                    "error": {"message": "DeepSeek error", "status": resp.status_code, "model": model},
+                    "upstream": body,
+                },
+            )
+
+        return body
+    else:
+        # OpenRouter (existing logic)
+        return await call_openrouter_best_effort(payload, request)
+
+
+def _detect_provider(model: str) -> str:
+    """Detect provider from model ID."""
+    if isinstance(model, str) and model.startswith("deepseek/"):
+        return "deepseek"
+    return "openrouter"
+
+
+@router.post("/chat", response_model=AIChatResult)
+async def chat(request: Request, req: AIChatRequest):
+    model = req.primaryModelId
+
+    user_obj = getattr(getattr(request, "state", None), "user", None)
+    stable_user = str(user_obj.id) if user_obj and getattr(user_obj, "id", None) else None
+
+    payload = {
+        "model": model,
+        "messages": [m.model_dump() for m in req.messages],
+        "stream": False,
+    }
+    if stable_user:
+        payload["user"] = stable_user
+
+    provider = _detect_provider(model)
+    data = await _call_provider(payload, request, provider)
+
+    content = extract_text_content(data)
+    used_model = extract_used_model(data, fallback=model)
+
+    if not (content or "").strip():
+        raise HTTPException(status_code=502, detail={"error": f"Empty content from {provider}", "usedModelId": used_model})
+
+    return {"content": content, "usedModelId": used_model}
+
+
+app.include_router(router)
